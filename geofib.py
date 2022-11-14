@@ -1,14 +1,17 @@
 """
 geofib.py
 
-
+Process survey fixes taken by a GNSS survey tool in KML/KMZ format.
+  - Merges fixes from multiple files into one.
+  - Cleans fix names exported from the SW Maps data capture app.
+  - Categorizes fixes into layers based on type, and sets styles accordingly.
 """
 
-import logging
+import logging, os
 import yaml
 
-from zipfile import ZipFile
-from fastkml import kml
+from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
+from fastkml import kml, styles, geometry
 
 LOGGER = logging.getLogger('geofib')
 
@@ -18,9 +21,11 @@ class GeofibError(Exception):
 
 
 class Geofib:
-    def __init__(self, config=None):
+    def __init__(self, config=None, iconscale=None):
         self.config = config or {}
         self.doc = kml.KML()
+        self.new_polystyles, self.new_iconstyles = {}, {}
+        self.iconscale = iconscale if iconscale else float(self.config.get('iconscale', 1.0))
 
     @property
     def fixnames(self):
@@ -29,47 +34,69 @@ class Geofib:
         elecname = 'Electric'
         wgwname = 'Water, Gas, and Wastewater'
         commname = 'Communications'
+        archivename = 'Vertices and Plow/Bore Controls'
         return {
-            'FENCE': (structname, ),
-            'BLDG': (structname, ),
-            'tree': (structname, ),
+            'FENCE': (structname, 'fence-black.png'),
+            'BLDG': (structname, 'house-black.png'),
+            'tree': (structname, 'tree-black.png'),
+
+            'EOP': (drivename, 'flag-black.png'),
+            'DWY': (drivename, 'door-black.png'),
+            'JCT': (drivename, 'door-black.png'),
+            'CROWN': (drivename, 'flag-black.png'),
+            'MONSTR': (drivename, 'peg-black.png'),
+            'monument': (drivename, 'peg-black.png'),
+            'survey': (drivename, 'peg-black.png'),
+            'corner': (drivename, 'peg-black.png'),
+
+            'WWLAT': (wgwname, 'whirl-green.png'),
+            'WWMH': (wgwname, 'whirl-green.png'),
+            'WWCO': (wgwname, 'whirl-green.png'),
+            'WW ': (wgwname, 'whirl-green.png'),
+            'storm': (wgwname, 'peg-green.png'),
+            'SDIN': (wgwname, 'peg-green.png'),
             
-            'EOP': (drivename, ),
-            'DWY': (drivename, ),
-            'CROWN': (drivename, ),
-            'MONSTR': (drivename, ),
+            'WTMAIN': (wgwname, 'water-blue.png'),
+            'WTTEE': (wgwname, 'water-blue.png'),
+            'WTSVC': (wgwname, 'water-blue.png'),
+            'WTFH': (wgwname, 'fire-blue.png'),
+            'WTFS': (wgwname, 'fire-blue.png'), # fire standpipe
+            'WTVMAIN': (wgwname, 'water-blue.png'),
+            'WTVFH': (wgwname, 'fire-blue.png'),
+            'WTVFS': (wgwname, 'fire-blue.png'),
+            'WTVSVC': (wgwname, 'water-blue.png'),
+            'WTVBLDG': (wgwname, 'water-blue.png'),
+            'WTV': (wgwname, 'water-blue.png'),
+            'WTLINESTOP': (wgwname, 'water-blue.png'),
+            'WTM': (wgwname, 'water-blue.png'),
+            'WTANOBOX': (wgwname, 'water-blue.png'),
             
-            'WWLAT': (wgwname, ),
-            'WWMH': (wgwname, ),
-            'WWCO': (wgwname, ),
-            'WTMAIN': (wgwname, ),
-            'WTTEE': (wgwname, ),
-            'WTSVC': (wgwname, ),
-            'WTFH': (wgwname, ),
-            'WTFS': (wgwname, ), # fire standpipe
-            'WTVMAIN': (wgwname, ),
-            'WTVFH': (wgwname, ),
-            'WTVFS': (wgwname, ),
-            'WTVSVC': (wgwname, ),
-            'WTVBLDG': (wgwname, ),
-            'WTV': (wgwname, ),
-            'WTLINESTOP': (wgwname, ),
-            'WTM': (wgwname, ),
-            'WTANOBOX': (wgwname, ),
-            'STIN': (wgwname, ),
-            'gas ': (wgwname, ),
-            'propane': (wgwname, ),
-            'storm': (wgwname, ),
-            'irrig': (wgwname, ),
+            'GSVC': (wgwname, 'peg-yellow.png'),
+            'GVSVC': (wgwname, 'peg-yellow.png'),
+            'gas ': (wgwname, 'peg-yellow.png'),
+            'propane': (wgwname, 'peg-yellow.png'),
+            'irrig': (wgwname, 'peg-blue.png'),
             
-            'ELVLT': (elecname, ),
-            'ELSVC': (elecname, ),
-            'XFRMR': (elecname, ),
-            'electric': (elecname, ),
+            'ELVLT': (elecname, 'electric-red.png'),
+            'EMH': (elecname, 'electric-red.png'),
+            'ELSVC': (elecname, 'electric-red.png'),
+            'XFRMR': (elecname, 'electric-red.png'),
+            'CPAU pole': (elecname, 'electric-red.png'),
+            'CPAU guy': (elecname, 'peg-red.png'),
+            'PG&E': (elecname, 'electric-red.png'),
+            'electric': (elecname, 'electric-red.png'),
+            'primary': (elecname, 'electric-red.png'),
+            'secondary': (elecname, 'electric-red.png'),
             
-            'TELVAULT': (commname, ),
-            'FVAULT': (commname, ),
-            'FDEMARC': (commname, )
+            'TELVAULT': (commname, 'phone-orange.png'),
+            'TELDMARC': (commname, 'phone-orange.png'),
+            'TELMH': (commname, 'phone-orange.png'),
+            'FVAULT': (commname, 'phone-orange.png'),
+            'FMH': (commname, 'phone-orange.png'),
+            'FDEMARC': (commname, 'phone-orange.png'),
+            'AT&T pole': (commname, 'phone-orange.png'),
+
+            'plow': (archivename, 'peg-orange.png'),
             }
     
     def read_bases(self):
@@ -91,7 +118,7 @@ class Geofib:
     def verify(self, elem=None):
         if elem is None:
             return self.verify(self.doc)
-        if getattr(elem, 'features', None):
+        if hasattr(elem, 'features'):
             # we don't verify interior (non-leaf) nodes
             return sum([self.verify(e) for e in elem.features()])
         if 'wtlat' in elem.name.lower():
@@ -102,7 +129,14 @@ class Geofib:
                 LOGGER.info(f'renamed {elem.name} to {newname}')
                 elem.name = newname
         if elem.description is None:
+            # then this isn't a type of object that we might modify
             return 0
+        self._verify_element_name(elem)
+        v = self._verify_element_description(elem)
+        self._verify_element_style(elem, self.iconscale)
+        return v
+
+    def _verify_element_name(self, elem):
         def upper(s):
             for f in self.fixnames.keys():
                 s = s.replace(f.lower(), f)
@@ -115,42 +149,252 @@ class Geofib:
             LOGGER.info(f'set name to {newname}')
             elem.name = newname
             elem.description = rest
+
+    def _verify_element_description(self, elem):
         (first, sep, quality) = elem.description.partition('Fix Quality: ')
         if not sep:
             return 0
-        def fix(e, prefix):
-            suffix = e.name.lstrip('*!?')
-            e.name = prefix + suffix
+        def stripit(name):
+            return name.lstrip('*!?~')
         if quality.startswith('DGPS'):
             if not elem.name.startswith('!'):
-                fix(elem, '!')
-                LOGGER.info(f'{elem.name} set prefix for DGPS')
+                elem.name = '!' + stripit(elem.name)
+                LOGGER.info(f'set prefix for DGPS: {elem.name}')
         elif quality.startswith('RTK Fix'):
-            if not elem.name.startswith('*'):
-                fix(elem, '*')
-                LOGGER.info(f'{elem.name} set prefix for RTK Fix')
+            stripped = stripit(elem.name)
+            #if not elem.name.startswith('*'):
+            if elem.name != stripped:
+                elem.name = '*' + stripit(elem.name)
+                LOGGER.info(f'set prefix for RTK Fix: {elem.name}')
         elif quality.startswith('RTK Float'):
-            if elem.name.startswith('*') or elem.name.startswith('!'):
-                fix(elem, '')
-                LOGGER.info(f'{elem.name} set prefix for RTK Float')
+            if not elem.name.startswith('~'):
+                elem.name = '~' + stripit(elem.name)
+                LOGGER.info(f'set prefix for RTK Float: {elem.name}')
         elif quality.startswith('Single'):
             if not elem.name.startswith('?'):
-                fix(elem, '?')
-                LOGGER.info(f'{elem.name} set prefix for Single')
+                elem.name = '?' + stripit(elem.name)
+                LOGGER.info(f'set prefix for Single: {elem.name}')
         else:
-            LOGGER.warning(f'{elem.name} unknown quality {quality}')
+            LOGGER.warning(f'{elem.name} has unknown fix quality {quality}')
         return 1
 
-    def emit(self, filename=None, prettyprint=None):
+    def _verify_element_style(self, elem, iconscale):
+        if isinstance(getattr(elem, 'geometry', None), geometry.Point):
+            for (n, spec) in self.fixnames.items():
+                if n in elem.name:
+                    (layername, iconname, *rest) = spec
+                    styleid = n.lower()
+                    styleurl = f'#{styleid}'
+                    if elem.styleUrl != styleurl:
+                        elem.styleUrl = styleurl
+                    color = rest[0] if rest else None
+                    scale = rest[1] if rest and len(rest) > 1 else iconscale
+                    self.new_iconstyles[styleid] = (iconname, color, scale)
+                    return
+
+    def move_layers(self):
+        folder_by_foldername = {}  # in the first document only
+        def _find_toplevel_folders(elem):
+            if isinstance(elem, kml.Folder):
+                folder_by_foldername[elem.name] = elem
+            elif hasattr(elem, 'features'):
+                for f in elem.features():
+                    _find_toplevel_folders(f)
+        dociter = self.doc.features()
+        firstdoc = next(dociter)
+        _find_toplevel_folders(firstdoc)
+
+        newfolders = []
+        def _get_folder_for(foldername):
+            f = folder_by_foldername.get(foldername, None)
+            if not f:
+                f = kml.Folder(name=foldername)
+                folder_by_foldername[foldername] = f
+                newfolders.append(f)
+                LOGGER.info(f'adding layer {f.name}')
+            return f
+
+        def _move(elem, foldernames_to_ignore, parent_foldername):
+            if isinstance(elem, kml.Folder):
+                if elem.name not in foldernames_to_ignore:
+                    any_deleted = False
+                    notdeleted = []
+                    for f in elem.features():
+                        if _move(f, foldernames_to_ignore, parent_foldername):
+                            any_deleted = True
+                        else:
+                            notdeleted.append(f)
+                    if any_deleted:
+                        elem._features = notdeleted
+            elif hasattr(elem, 'features'):
+                for f in elem.features():
+                    _move(f, foldernames_to_ignore, elem.name)
+            elif parent_foldername and isinstance(getattr(elem, 'geometry', None), geometry.Point):
+                # we are a leaf Point within a folder
+                for (k, props) in self.fixnames.items():
+                    if k in elem.name:
+                        if parent_foldername != props[0] or (not foldernames_to_ignore):
+                            LOGGER.info(f'moving {elem.name} from {parent_foldername} to {props[0]}')
+                            folder = _get_folder_for(props[0])
+                            folder.append(elem)
+                            return True
+                        break
+            return False
+
+        folders_to_ignore = { v[0] for v in self.fixnames.values() }
+        folders_to_ignore.add('Locator Fixes and Plow/Bore Controls') ### FIXME
+        _move(firstdoc, folders_to_ignore, '')
+        for otherdoc in dociter:
+            _move(otherdoc, {}, '')
+        for f in newfolders:
+            # now that we are done with the iterator, add the new layers
+            firstdoc.append(f)
+
+    def replace_styles(self, defaulticon=None, kmliconprefix=None):
+        """Adds to the first document the styles defined in
+        self.new_polystyles and self.new_iconstyles. Systematically
+        creates highlight and normal styles. Then replaces any styleurls that
+        aren't in new_polystyles or new_iconstyles with a default style.
+        """
+        if defaulticon is None:
+            defaulticon = self.config.get('defaulticon', 'triangle.png')
+        if kmliconprefix is None:
+            kmliconprefix = self.config.get('kmliconprefix', 'icons/')
+        firstdoc = next(self.doc.features())
+        self._clean_unused_styles(firstdoc)
+        def append(s):
+            firstdoc.append_style(s)
+
+        self.new_polystyles['defaultpoly'] = ('FF000000', '50000000')
+        for (name, properties) in self.new_polystyles.items():
+            (linecolor, polycolor) = properties
+            polystyle = styles.PolyStyle(color=polycolor, fill=1, outline=1)
+            def _makestyles(width):
+                return [styles.LineStyle(color=linecolor, width=width), polystyle]
+            namenorm = f'{name}-normal'
+            namehigh = f'{name}-highlight'
+            append(styles.Style(id=namenorm, styles=_makestyles(width=2.0)))
+            append(styles.Style(id=namehigh, styles=_makestyles(width=3.0)))
+            append(styles.StyleMap(id=name, normal=styles.StyleUrl(url=f'#{namenorm}'),
+                                   highlight=styles.StyleUrl(url=f'#{namehigh}')))
+
+        self.new_iconstyles['defaulticon'] = (
+            defaulticon, 'FF000000', self.config.get('iconscale', 0.5))
+        for (name, properties) in self.new_iconstyles.items():
+            (iconfile, iconcolor, iconscale) = properties
+            def _makestyles(labelscale):
+                return [styles.IconStyle(color=iconcolor, scale=iconscale,
+                                         icon_href=f'{kmliconprefix}{iconfile}'),
+                        styles.LabelStyle(scale=labelscale)]
+            namenorm = f'{name}-normal'
+            namehigh = f'{name}-highlight'
+            append(styles.Style(id=namenorm, styles=_makestyles(labelscale=0.0)))
+            append(styles.Style(id=namehigh, styles=_makestyles(labelscale=1.0)))
+            append(styles.StyleMap(id=name, normal=styles.StyleUrl(url=f'#{namenorm}'),
+                                   highlight=styles.StyleUrl(url=f'#{namehigh}')))
+
+        newstyleids = set(self.new_iconstyles).union(self.new_polystyles)
+        self._fix_bad_styleurls(self.doc, newstyleids)
+
+    def _clean_unused_styles(self, doc):
+        """Removes IconStyle elements and associated stylemaps from doc._styles."""
+        def _contains_iconstyle(s):
+            if hasattr(s, 'styles'):
+                for s in s.styles():
+                    if isinstance(s, styles.IconStyle):
+                        return True
+                    if _contains_iconstyle(s):
+                        return True
+            return False
+
+        ids_to_remove = set()
+        for s in doc.styles():
+            if _contains_iconstyle(s):
+                ids_to_remove.add(s.id)
+        for s in doc.styles():
+            if isinstance(s, styles.StyleMap):
+                if s.normal.url[0] == '#' and s.normal.url[1:] in ids_to_remove:
+                    ids_to_remove.add(s.id)
+                if s.highlight.url[0] == '#' and s.highlight.url[1:] in ids_to_remove:
+                    ids_to_remove.add(s.id)
+
+        previous = len(doc._styles)
+        doc._styles = [s for s in doc._styles if s.id not in ids_to_remove]
+        if previous != len(doc._styles):
+            LOGGER.info(f'removed {previous - len(doc._styles)} unused styles')
+
+    def _fix_bad_styleurls(self, elem, newstyleids):
+        k = 0
+        styleUrl = getattr(elem, 'styleUrl', None)
+        if styleUrl and styleUrl[1:] not in newstyleids:
+            if isinstance(getattr(elem, 'geometry', None), geometry.Point):
+                elem.styleUrl = '#defaulticon'
+                LOGGER.info(f'set default style for {elem.name} replacing {styleUrl}')
+            elif False: ### TODO: someday we might do this
+                elem.styleUrl = '#defaultpoly'
+                LOGGER.info(f'set default poly style for {elem.name}')
+            k += 1
+        if hasattr(elem, 'features'):
+            # not a leaf node
+            k += sum([self._fix_bad_styleurls(e, newstyleids) for e in elem.features()])
+        return k
+
+    def set_properties(self, name=None, description=None, author=None):
+        if name is None:
+            name = self.config.get('name', None)
+        if description is None:
+            description = self.config.get('description', None)
+        if author is None:
+            author = self.config.get('author', None)
+        firstdoc = next(self.doc.features())
+        if name is not None:
+            firstdoc.name = name
+        if description is not None:
+            firstdoc.description = description
+        if author is not None:
+            firstdoc.author = author
+
+    def emit(self, filename=None, prettyprint=None, defaulticonpath=None):
         if filename is None:
-            return self.emit(self.config['output'], prettyprint)
+            return self.emit(self.config['output'], prettyprint, defaulticonpath)
         if prettyprint is None:
-            return self.emit(filename, self.config.get('prettyprint', False))
+            return self.emit(filename, self.config.get('prettyprint', False), defaulticonpath)
+        if defaulticonpath is None:
+            icon = self.config.get('defaulticon', '')
+            dip = self.config.get('kmliconprefix', '') + icon
+            return self.emit(filename, prettyprint, dip if icon else '')
+        # remove all but the first document
+        self.doc._features = [next(self.doc.features())]
         if filename.endswith('.kml'):
             with open(filename, 'wt') as f:
                 f.write(self.doc.to_string(prettyprint=prettyprint))
         elif filename.endswith('.kmz'):
-            LOGGER.fatal('.kmz format not implemented yet')
+            def _get_iconnames(elem, accum):
+                if hasattr(elem, 'styles'):
+                    for s in elem.styles():
+                        if isinstance(s, styles.IconStyle):
+                            accum.add(s.icon_href)
+                        _get_iconnames(s, accum)
+                if hasattr(elem, 'features'):
+                    for e in elem.features():
+                        _get_iconnames(e, accum)
+
+            iconnames = set()
+            _get_iconnames(self.doc, iconnames)
+            with ZipFile(filename, mode='w', compression=ZIP_DEFLATED) as zipf:
+                with zipf.open('doc.kml', mode='w') as f:
+                    f.write(self.doc.to_string(prettyprint=prettyprint).encode())
+                for iconname in iconnames:
+                    if os.path.exists(iconname):
+                        zipf.write(iconname, iconname,
+                                   compress_type=ZIP_STORED)
+                    elif not defaulticonpath:
+                        LOGGER.fatal(f'no file {iconname} and no default icon')
+                    else:
+                        LOGGER.warning(f'{iconname} not in filesystem; using default '
+                                       + defaulticonpath)
+                        zipf.write(defaulticonpath, iconname,
+                                   compress_type=ZIP_STORED)
         else:
             raise GeofibError(f'unknown format for {filename}')
 
@@ -169,6 +413,9 @@ def main(args):
     g.read_bases()
     count = g.verify()
     LOGGER.info(f'verified {count} items')
+    g.move_layers()
+    g.replace_styles()
+    g.set_properties()
     if config.get('output'):
         g.emit()
     return 0
