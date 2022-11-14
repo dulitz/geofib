@@ -49,6 +49,19 @@ class Position:
 
 
 class Traverse:
+    """Represents a traverse as a collection of Positions (latitude/longitude).
+
+    When there is terrain (significant change in altitude) over a traverse, the
+    lat/long will deviate from the surveyed path. We assume Vincenty's ellipsoid,
+    but surveyed ranges along steep terrain can be much larger than distances over
+    the ellipsoid.
+
+    TODO: as_centerline() does not cover the case where a range is short relative
+    to the change in bearing and the inside path of the polygon is not defined by
+    each point of the traverse in order (a "pinwheel corner"). We can fix this by
+    calculating a rectangle corresponding to each segment of the traverse and
+    then merging all those rectangles together.
+    """
     def __init__(self, name, initial_position, source=None):
         self.name = name
         self.source = source
@@ -121,14 +134,12 @@ class Traverse:
                 # then the right vertex is farther away from the point
                 alpha = alpha_k + alpha_diff / 2
                 r = abs(right_in_feet / math.cos(alpha_diff * piD4 / 90.0))
-                right.append(displace(point, r, alpha+90))
-                left_rev.append(displace(point, left_in_feet, alpha-90))
+                add(point, r, left_in_feet, alpha)
             else: # centerline turns left at point
                 # then the left vertex is farther away from the point
                 alpha = alpha_k + alpha_diff / 2
                 r = abs(left_in_feet / math.cos(alpha_diff * piD4 / 90.0))
-                left_rev.append(displace(point, r, alpha+90))
-                right.append(displace(point, right_in_feet, alpha-90))
+                add(point, right_in_feet, r, alpha+180)
         add(self.points[-1], right_in_feet, left_in_feet, azimuths[-1])
         left_rev.reverse()
         return right + left_rev
