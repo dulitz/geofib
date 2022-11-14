@@ -12,6 +12,9 @@ import yaml
 
 from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
 from fastkml import kml, styles, geometry
+from shapely.geometry import polygon
+
+import cogo
 
 LOGGER = logging.getLogger('geofib')
 
@@ -164,7 +167,7 @@ class Geofib:
             stripped = stripit(elem.name)
             #if not elem.name.startswith('*'):
             if elem.name != stripped:
-                elem.name = '*' + stripit(elem.name)
+                elem.name = stripit(elem.name)
                 LOGGER.info(f'set prefix for RTK Fix: {elem.name}')
         elif quality.startswith('RTK Float'):
             if not elem.name.startswith('~'):
@@ -339,6 +342,80 @@ class Geofib:
             k += sum([self._fix_bad_styleurls(e, newstyleids) for e in elem.features()])
         return k
 
+    def add_cogo(self):
+        for (name, spec) in self.config.get('polygons', {}).items():
+            self.add_polygon(name, spec)
+        for (name, spec) in self.config.get('polylines', {}).items():
+            self.add_polyline(name, spec)
+
+    def folder_element(self, placemark_name, elem=None):
+        """Returns a 2-tuple of elements, the second being the Placemark with the
+        specified name, and the first being the Folder enclosing the Placemark.
+        """
+        if elem is None:
+            return self.folder_element(placemark_name, next(self.doc.features()))
+        if hasattr(elem, 'features'):
+            for f in elem.features():
+                tup = self.folder_element(placemark_name, f)
+                if tup:
+                    return tup if len(tup) == 2 else (elem, tup[0])
+        elif isinstance(elem, kml.Placemark) and elem.name == placemark_name:
+            return (elem,)
+        else:
+            return []
+
+    def add_polyline(self, name, spec):
+        pass # FIXME
+
+    def add_polygon(self, name, spec):
+        if len(spec) < 2:
+            raise GeofibError(f'polygon {name} specification too short')
+        (tie_name, tie_authority) = spec[0]
+        tup = self.folder_element(tie_name)
+        if not tup:
+            raise GeofibError(f'polygon {name} nonexistent tie fix: {tie_name}')
+        (tie_folder, tie_elem) = tup
+        tie_geometry = getattr(tie_elem, 'geometry', None) 
+        if not isinstance(tie_geometry, geometry.Point):
+            raise GeofibError(f'polygon {name}: tie fix {tie_name} does not have Point geometry')
+
+        position = cogo.Position(tie_geometry.y, tie_geometry.x)
+        traverse = cogo.Traverse(name, position, source=tie_authority)
+        comments = []
+        coords = []
+        for specitem in spec[1:]:
+            if coords:
+                raise GeofibError(f'polygon {name} already complete but read {specitem}')
+            if specitem == 'closes':
+                (range_f, bearing) = traverse.range_bearing_to_close()
+                if range_f > 0.5:
+                    LOGGER.warning(f'polygon {name} does not close by {range_f} feet bearing {bearing}')
+                coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
+            elif specitem == 'beginning':
+                traverse.begin()
+            elif specitem[0].lower() == 'centerline':
+                (centerline, right_f, left_f) = specitem
+                coords = [(pos.longitude, pos.latitude) for pos in traverse.as_centerline(right_f, left_f)]
+            else:
+                (dir1, alpha, dir2, distance, *comment) = specitem
+                azimuth = cogo.parse_azimuth(specitem)
+                distance = specitem[3]
+                traverse.thence_to(distance, azimuth)
+                if comment:
+                    comments.append(comment[0])
+        if not coords:
+            coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
+        pgon = polygon.orient(polygon.Polygon(coords))
+        tup = self.folder_element(name)  # existing polygon of this name?
+        if tup:
+            polygon_elem = tup[1]
+        else:
+            polygon_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
+            tie_folder.append(polygon_elem)
+        polygon_elem.geometry = pgon
+        polygon_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
+        LOGGER.info(f'created polygon {name}')
+
     def set_properties(self, name=None, description=None, author=None):
         if name is None:
             name = self.config.get('name', None)
@@ -389,7 +466,7 @@ class Geofib:
                         zipf.write(iconname, iconname,
                                    compress_type=ZIP_STORED)
                     elif not defaulticonpath:
-                        LOGGER.fatal(f'no file {iconname} and no default icon')
+                        raise GeofibError(f'no file {iconname} and no default icon')
                     else:
                         LOGGER.warning(f'{iconname} not in filesystem; using default '
                                        + defaulticonpath)
@@ -415,6 +492,7 @@ def main(args):
     LOGGER.info(f'verified {count} items')
     g.move_layers()
     g.replace_styles()
+    g.add_cogo()
     g.set_properties()
     if config.get('output'):
         g.emit()
