@@ -34,6 +34,10 @@ class Position:
     def __eq__(self, other):
         return self.latitude == other.latitude and self.longitude == other.longitude
 
+    def __repr__(self):
+        ew = 'E' if self.longitude >= 0 else 'W'
+        return f'[Position: {self.latitude} N, {abs(self.longitude)} {ew}]'
+
     def displace(self, range_in_feet, azimuth):
         range_in_meters = range_in_feet / self.FEET_METERS_FACTOR
         (self.latitude, self.longitude, ignore_reverse_bearing) = vincenty.position_from_rangebearing(self.latitude, self.longitude, azimuth, range_in_meters)
@@ -56,12 +60,12 @@ class Traverse:
         """The cursor is at the True Point of Beginning."""
         if self.points:
             raise ParseError(f'beginning when already begun: while parsing {self.name} at {self.cursor}')
-        self.points.append(self.cursor)
+        self.points.append(self.cursor.copy())
         
     def thence_to(self, range_in_feet, azimuth):
         self.cursor.displace(range_in_feet, azimuth)
         if self.points:
-            self.points.append(self.cursor)
+            self.points.append(self.cursor.copy())
             self.rangeazimuths.append((range_in_feet, azimuth))
 
     def range_bearing_to_close(self):
@@ -82,7 +86,7 @@ class Traverse:
             raise ParseError(f'polygon needs >= 3 points: {self.name}, {self.points}')
         assert len(self.points) == len(self.rangeazimuths) + 1
         closure = [] if self.points[0] == self.points[-1] else self.points[0].copy()
-        return [p.copy() for p in self.points] + closure
+        return [p.copy() for p in self.points] + [closure]
 
     def as_centerline(self, right_in_feet, left_in_feet):
         """Treating the traverse as a centerline, returns Positions forming
@@ -98,9 +102,16 @@ class Traverse:
         right = []
         left_rev = []
         azimuths = [alpha for (r, alpha) in self.rangeazimuths]
+        def displace(point, range_f, bearing):
+            if range_f == 0:
+                return point
+            pt = point.copy()
+            pt.displace(range_f, bearing % 360)
+            return pt
         def add(point, right_in_feet, left_in_feet, azimuth):
-            right.append(point.copy().displace(right_in_feet, azimuth+90))
-            left_rev.append(point.copy().displace(left_in_feet, azimuth-90))
+            right.append(displace(point, right_in_feet, azimuth+90))
+            left_rev.append(displace(point, left_in_feet, azimuth-90))
+
         add(self.points[0], right_in_feet, left_in_feet, azimuths[0])
         for (alpha_k, point, alpha_kP1) in zip(azimuths, self.points[1:], azimuths[1:]):
             alpha_diff = (alpha_kP1 - alpha_k) % 360
@@ -108,16 +119,16 @@ class Traverse:
                 raise ParseError(f'angle {alpha_diff} too acute: {self.name}, {point}')
             if alpha_diff < 180: # centerline turns right at point
                 # then the right vertex is farther away from the point
-                alpha = alpha_k + alpha_diff / 2 + 90
-                r = right_in_feet / Math.cos(alpha_diff * piD4 / 90.0)
-                right.append(point.copy().displace(r, alpha))
-                left_rev.append(point.copy().displace(left_in_feet, alpha-180))
+                alpha = alpha_k + alpha_diff / 2
+                r = abs(right_in_feet / math.cos(alpha_diff * piD4 / 90.0))
+                right.append(displace(point, r, alpha+90))
+                left_rev.append(displace(point, left_in_feet, alpha-90))
             else: # centerline turns left at point
                 # then the left vertex is farther away from the point
-                alpha = alpha_k - alpha_diff / 2 - 90
-                r = left_in_feet / Math.cos(alpha_diff * piD4 / 90.0)
-                left_rev.append(point.copy().displace(r, alpha))
-                right.append(point.copy().displace(right_in_feet, alpha+180))
+                alpha = alpha_k + alpha_diff / 2
+                r = abs(left_in_feet / math.cos(alpha_diff * piD4 / 90.0))
+                left_rev.append(displace(point, r, alpha+90))
+                right.append(displace(point, right_in_feet, alpha-90))
         add(self.points[-1], right_in_feet, left_in_feet, azimuths[-1])
         left_rev.reverse()
         return right + left_rev
