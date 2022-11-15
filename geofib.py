@@ -31,13 +31,17 @@ class Geofib:
         self.iconscale = iconscale if iconscale else float(self.config.get('iconscale', 1.0))
 
     @property
+    def DEFAULT_FOLDER(self):
+        return 'Vertices and Plow/Bore Controls'
+
+    @property
     def fixnames(self):
         structname = 'Structures, Fences, and Edges'
         drivename = 'Driveways, Roads, and Monuments'
         elecname = 'Electric'
         wgwname = 'Water, Gas, and Wastewater'
         commname = 'Communications'
-        archivename = 'Vertices and Plow/Bore Controls'
+        archivename = self.DEFAULT_FOLDER
         return {
             'FENCE': (structname, 'fence-black.png'),
             'BLDG': (structname, 'house-black.png'),
@@ -195,7 +199,9 @@ class Geofib:
                     self.new_iconstyles[styleid] = (iconname, color, scale)
                     return
 
-    def move_layers(self):
+    def move_layers(self, default_folder=None):
+        if default_folder is None:
+            default_folder = self.config.get('default_folder', self.DEFAULT_FOLDER)
         folder_by_foldername = {}  # in the first document only
         def _find_toplevel_folders(elem):
             if isinstance(elem, kml.Folder):
@@ -238,10 +244,13 @@ class Geofib:
                     if k in elem.name:
                         if parent_foldername != props[0] or (not foldernames_to_ignore):
                             LOGGER.info(f'moving {elem.name} from {parent_foldername} to {props[0]}')
-                            folder = _get_folder_for(props[0])
-                            folder.append(elem)
+                            _get_folder_for(props[0]).append(elem)
                             return True
                         break
+                else:  # we don't match any of the predefined fix types
+                    LOGGER.info(f'moving {elem.name} from {parent_foldername} to {default_folder}')
+                    _get_folder_for(default_folder).append(elem)
+                    return True
             return False
 
         folders_to_ignore = { v[0] for v in self.fixnames.values() }
@@ -365,31 +374,58 @@ class Geofib:
             return []
 
     def add_polyline(self, name, spec):
-        pass # FIXME
+        (traverse, coords, comments) = self._add_poly(name, spec, polytype='polyline')
+        pline = geometry.LineString([(pos.longitude, pos.latitude) for pos in traverse.points])
+        tup = self.folder_element(name)  # existing polyline of this name?
+        if tup:
+            polyline_elem = tup[1]
+        else:
+            polyline_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
+            (tie_folder, tie_elem) = self.folder_element(spec[0][0])
+            tie_folder.append(polyline_elem)
+        polyline_elem.geometry = pline
+        polyline_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
+        LOGGER.info(f'created polyline {name}')
 
-    def add_polygon(self, name, spec):
+    def add_polygon(self, name, spec, polytype='polygon'):
+        (traverse, coords, comments) = self._add_poly(name, spec, polytype='polygon')
+        if not coords:
+            coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
+        pgon = polygon.orient(polygon.Polygon(coords))
+        tup = self.folder_element(name)  # existing polygon of this name?
+        if tup:
+            polygon_elem = tup[1]
+        else:
+            polygon_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
+            (tie_folder, tie_elem) = self.folder_element(spec[0][0])
+            tie_folder.append(polygon_elem)
+        polygon_elem.geometry = pgon
+        polygon_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
+        LOGGER.info(f'created polygon {name}')
+
+    def _add_poly(self, name, spec, polytype='polygon'):
         if len(spec) < 2:
-            raise GeofibError(f'polygon {name} specification too short')
+            raise GeofibError(f'{polytype} {name} specification too short')
         (tie_name, tie_authority) = spec[0]
         tup = self.folder_element(tie_name)
         if not tup:
-            raise GeofibError(f'polygon {name} nonexistent tie fix: {tie_name}')
+            raise GeofibError(f'{polytype} {name} nonexistent tie fix: {tie_name}')
         (tie_folder, tie_elem) = tup
         tie_geometry = getattr(tie_elem, 'geometry', None) 
         if not isinstance(tie_geometry, geometry.Point):
-            raise GeofibError(f'polygon {name}: tie fix {tie_name} does not have Point geometry')
+            raise GeofibError(f'{polytype} {name}: tie fix {tie_name} does not have Point geometry')
 
         position = cogo.Position(tie_geometry.y, tie_geometry.x)
         traverse = cogo.Traverse(name, position, source=tie_authority)
-        comments = []
         coords = []
+        comments = []
         for specitem in spec[1:]:
             if coords:
-                raise GeofibError(f'polygon {name} already complete but read {specitem}')
+                raise GeofibError(f'{polytype} {name} already complete but read {specitem}')
             if specitem == 'closes':
                 (range_f, bearing) = traverse.range_bearing_to_close()
                 if range_f > 0.5:
-                    LOGGER.warning(f'polygon {name} does not close by {range_f} feet bearing {bearing}')
+                    LOGGER.warning(f'{polytype} {name} does not close by {range_f} feet bearing {bearing}')
                 coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
             elif specitem == 'beginning':
                 traverse.begin()
@@ -403,18 +439,60 @@ class Geofib:
                 traverse.thence_to(distance, azimuth)
                 if comment:
                     comments.append(comment[0])
-        if not coords:
-            coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
-        pgon = polygon.orient(polygon.Polygon(coords))
-        tup = self.folder_element(name)  # existing polygon of this name?
-        if tup:
-            polygon_elem = tup[1]
+        return (traverse, coords, comments)
+
+    def add_poly_from_fixes(self, projector_elem=None):
+        def _collect_projectors(elem, accum):
+            if hasattr(elem, 'features'):
+                for f in elem.features():
+                    self._collect_projectors(f, accum)
+            if ' PARTITION ' in elem.name or ' PROJECTOR ' in elem.name:
+                accum.append(elem)
+        if projector_elem is None:
+            accum = []
+            _collect_projectors(self.doc, accum)
+            for elem in accum:
+                self.add_poly_from_fixes(projector_elem=elem)
+            return
+        projector_geo = projector_elem.geometry
+        assert isinstance(projector_geo, geometry.LineString), name
+        desc = projector_elem.description.split()
+        distance_f = int(desc[0]) if desc else 20.0
+        distance_deg = distance_f / 6074 / 60  # approximate is fine if not at poles
+        (name, sep, selector_spec) = projector_elem.name.partition(' PARTITION ')
+        if sep:
+            left_geo = projector_geo.buffer(distance_deg, single_sided=True)
+            right_geo = projector_geo.buffer(-distance_deg, single_sided=True)
+            assert right is not None, name
         else:
-            polygon_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
-            tie_folder.append(polygon_elem)
-        polygon_elem.geometry = pgon
-        polygon_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
-        LOGGER.info(f'created polygon {name}')
+            (name, sep, selector_spec) = projector_elem.name.partition(' PROJECTOR ')
+            if not sep:
+                raise GeofibError(f'{elem.name} must contain PARTITION or PROJECTOR')
+            left_geo = projector_geo.buffer(distance_deg)
+            right_geo = None
+        selectors = selector_spec.split()
+
+        def _select_points(elem, left_accum, right_accum):
+            if hasattr(elem, 'features'):
+                for f in elem.features():
+                    _select_points(elem, left_accum, right_accum)
+            elif isinstance(getattr(elem, 'geometry', None), geometry.Point):
+                # we are a leaf Point
+                for s in selectors:
+                    if s in elem.name:
+                        if left_geo.contains(elem.geometry):
+                            left_accum.append((projector_geo.project(elem.geometry), elem))
+                        elif right_geo and right_geo.contains(elem.geometry):
+                            right_accum.append((projector_geo.project(elem.geometry), elem))
+                        break
+        left_accum, right_accum = [], []
+        _select_points(self.doc, left_accum, right_accum)
+        left_accum.sort()
+        if right_accum:
+            right_accum.sort(key=lambda p: -1*p[0])
+        # create geo, put it in the appropriate Placemark (possibly create one)
+        # move the vertices to the archive layer if they aren't already there
+        # (except for DWY which should not be moved).
 
     def set_properties(self, name=None, description=None, author=None):
         if name is None:
