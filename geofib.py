@@ -7,14 +7,14 @@ Process survey fixes taken by a GNSS survey tool in KML/KMZ format.
   - Categorizes fixes into layers based on type, and sets styles accordingly.
 """
 
-import logging, os
+import logging
 import yaml
 
-from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
+from zipfile import ZipFile
 from fastkml import kml, styles, geometry
 from shapely.geometry import polygon
 
-import cogo
+import cogo, fastkmlutils
 
 LOGGER = logging.getLogger('geofib')
 
@@ -202,16 +202,10 @@ class Geofib:
     def move_layers(self, default_folder=None):
         if default_folder is None:
             default_folder = self.config.get('default_folder', self.DEFAULT_FOLDER)
-        folder_by_foldername = {}  # in the first document only
-        def _find_toplevel_folders(elem):
-            if isinstance(elem, kml.Folder):
-                folder_by_foldername[elem.name] = elem
-            elif hasattr(elem, 'features'):
-                for f in elem.features():
-                    _find_toplevel_folders(f)
+        c = fastkmlutils.Collector(lambda n, e, f: None, lambda n, e, f: e if isinstance(e, kml.Folder) and not isinstance(f, kml.Folder) else None)
         dociter = self.doc.features()
         firstdoc = next(dociter)
-        _find_toplevel_folders(firstdoc)
+        folder_by_foldername = { folder.name: folder for folder in c.collect(firstdoc) }
 
         newfolders = []
         def _get_folder_for(foldername):
@@ -229,7 +223,7 @@ class Geofib:
                     any_deleted = False
                     notdeleted = []
                     for f in elem.features():
-                        if _move(f, foldernames_to_ignore, parent_foldername):
+                        if _move(f, foldernames_to_ignore, elem.name):
                             any_deleted = True
                         else:
                             notdeleted.append(f)
@@ -357,29 +351,18 @@ class Geofib:
         for (name, spec) in self.config.get('polylines', {}).items():
             self.add_polyline(name, spec)
 
-    def folder_element(self, placemark_name, elem=None):
+    def folder_element(self, placemark_name):
         """Returns a 2-tuple of elements, the second being the Placemark with the
         specified name, and the first being the Folder enclosing the Placemark.
         """
-        if elem is None:
-            return self.folder_element(placemark_name, next(self.doc.features()))
-        if hasattr(elem, 'features'):
-            for f in elem.features():
-                tup = self.folder_element(placemark_name, f)
-                if tup:
-                    return tup if len(tup) == 2 else (elem, tup[0])
-        elif isinstance(elem, kml.Placemark) and elem.name == placemark_name:
-            return (elem,)
-        else:
-            return []
+        c = fastkmlutils.Collector(lambda n, e, f: (f, e) if isinstance(e, kml.Placemark) and n == placemark_name else None)
+        return c.first(next(self.doc.features())) or (None, None)
 
     def add_polyline(self, name, spec):
         (traverse, coords, comments) = self._add_poly(name, spec, polytype='polyline')
         pline = geometry.LineString([(pos.longitude, pos.latitude) for pos in traverse.points])
-        tup = self.folder_element(name)  # existing polyline of this name?
-        if tup:
-            polyline_elem = tup[1]
-        else:
+        (f, polyline_elem) = self.folder_element(name)  # existing polyline of this name?
+        if not polyline_elem:
             polyline_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
             (tie_folder, tie_elem) = self.folder_element(spec[0][0])
             tie_folder.append(polyline_elem)
@@ -392,10 +375,8 @@ class Geofib:
         if not coords:
             coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
         pgon = polygon.orient(polygon.Polygon(coords))
-        tup = self.folder_element(name)  # existing polygon of this name?
-        if tup:
-            polygon_elem = tup[1]
-        else:
+        (f, polygon_elem) = self.folder_element(name)  # existing polygon of this name?
+        if not polygon_elem:
             polygon_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
             (tie_folder, tie_elem) = self.folder_element(spec[0][0])
             tie_folder.append(polygon_elem)
@@ -407,10 +388,9 @@ class Geofib:
         if len(spec) < 2:
             raise GeofibError(f'{polytype} {name} specification too short')
         (tie_name, tie_authority) = spec[0]
-        tup = self.folder_element(tie_name)
-        if not tup:
+        (tie_folder, tie_elem) = self.folder_element(tie_name)
+        if not tie_elem:
             raise GeofibError(f'{polytype} {name} nonexistent tie fix: {tie_name}')
-        (tie_folder, tie_elem) = tup
         tie_geometry = getattr(tie_elem, 'geometry', None) 
         if not isinstance(tie_geometry, geometry.Point):
             raise GeofibError(f'{polytype} {name}: tie fix {tie_name} does not have Point geometry')
@@ -442,23 +422,17 @@ class Geofib:
         return (traverse, coords, comments)
 
     def add_poly_from_fixes(self, projector_elem=None):
-        def _collect_projectors(elem, accum):
-            if hasattr(elem, 'features'):
-                for f in elem.features():
-                    self._collect_projectors(f, accum)
-            if ' PARTITION ' in elem.name or ' PROJECTOR ' in elem.name:
-                accum.append(elem)
         if projector_elem is None:
-            accum = []
-            _collect_projectors(self.doc, accum)
-            for elem in accum:
-                self.add_poly_from_fixes(projector_elem=elem)
+            c = fastkmlutils.Collector(lambda name, e, f: elem if ' PARTITION ' in name or ' PROJECTOR ' in name else None)
+            projector_elems = c.collect(self.doc)
+            for e in projector_elems:
+                self.add_poly_from_fixes(projector_elem=e)
             return
         projector_geo = projector_elem.geometry
         assert isinstance(projector_geo, geometry.LineString), name
         desc = projector_elem.description.split()
         distance_f = int(desc[0]) if desc else 20.0
-        distance_deg = distance_f / 6074 / 60  # approximate is fine if not at poles
+        distance_deg = distance_f / 6074 / 60  # approximation is fine if not at poles
         (name, sep, selector_spec) = projector_elem.name.partition(' PARTITION ')
         if sep:
             left_geo = projector_geo.buffer(distance_deg, single_sided=True)
@@ -521,35 +495,11 @@ class Geofib:
         # remove all but the first document
         self.doc._features = [next(self.doc.features())]
         if filename.endswith('.kml'):
-            with open(filename, 'wt') as f:
-                f.write(self.doc.to_string(prettyprint=prettyprint))
+            fastkmlutils.write_kml_file(filename, self.doc, prettyprint=prettyprint)
         elif filename.endswith('.kmz'):
-            def _get_iconnames(elem, accum):
-                if hasattr(elem, 'styles'):
-                    for s in elem.styles():
-                        if isinstance(s, styles.IconStyle):
-                            accum.add(s.icon_href)
-                        _get_iconnames(s, accum)
-                if hasattr(elem, 'features'):
-                    for e in elem.features():
-                        _get_iconnames(e, accum)
-
-            iconnames = set()
-            _get_iconnames(self.doc, iconnames)
-            with ZipFile(filename, mode='w', compression=ZIP_DEFLATED) as zipf:
-                with zipf.open('doc.kml', mode='w') as f:
-                    f.write(self.doc.to_string(prettyprint=prettyprint).encode())
-                for iconname in iconnames:
-                    if os.path.exists(iconname):
-                        zipf.write(iconname, iconname,
-                                   compress_type=ZIP_STORED)
-                    elif not defaulticonpath:
-                        raise GeofibError(f'no file {iconname} and no default icon')
-                    else:
-                        LOGGER.warning(f'{iconname} not in filesystem; using default '
-                                       + defaulticonpath)
-                        zipf.write(defaulticonpath, iconname,
-                                   compress_type=ZIP_STORED)
+            fastkmlutils.write_kmz_file(filename, self.doc,
+                                        icon_not_found=defaulticonpath,
+                                        prettyprint=prettyprint)
         else:
             raise GeofibError(f'unknown format for {filename}')
 
@@ -571,6 +521,7 @@ def main(args):
     g.move_layers()
     g.replace_styles()
     g.add_cogo()
+    g.add_poly_from_fixes()
     g.set_properties()
     if config.get('output'):
         g.emit()
