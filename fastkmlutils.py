@@ -14,6 +14,15 @@ LOGGER = logging.getLogger('fastkmlutils')
 class FastkmlError(Exception):
     pass
 
+def read_kml_file(filename, kml):
+    """Read filename and append it to kml."""
+    if filename.endswith('.kmz'):
+        kmz = ZipFile(filename, 'r')
+        with kmz.open('doc.kml', 'r') as kmlfile:
+            kml.from_string(kmlfile.read())
+    else:
+        with open(filename, encoding='utf-8') as kmlfile:
+            kml.from_string(kmlfile.read())
 
 def write_kml_file(filename, kml, prettyprint=False):
     """Write kml to filename as a KML file."""
@@ -46,6 +55,7 @@ def write_kmz_file(filename, kml, icon_not_found=None, prettyprint=False):
                 LOGGER.warning(f'{iconname} not in filesystem, using {icon_not_found}')
                 zipf.write(icon_not_found, iconname, compress_type=ZIP_STORED)
 
+
 class Collector:
     def __init__(self, leaf_mapper, interior_mapper=None):
         self.leaf_mapper = leaf_mapper
@@ -54,7 +64,7 @@ class Collector:
     def collect(self, kml):
         accum = []
         def visitor(elem, folder):
-            n = getattr(elem, 'name', '')
+            n = getattr(elem, 'name', None)
             if hasattr(elem, 'features'):
                 for f in elem.features():
                     visitor(f, elem)
@@ -79,3 +89,32 @@ class Collector:
                 r = self.leaf_mapper(n, elem, folder)
             return r
         return visitor(kml, None)
+
+
+class LeafDeleter:
+    """Calls predicate on every leaf. If predicate is true, the leaf is deleted.
+    Predicate may perform other functions (such as adding the leaf to a different
+    part of the tree) before returning true.
+    """
+    def __init__(self, predicate):
+        self.predicate = predicate
+
+    def operate(self, node):
+        def visitor(elem, folder):
+            if isinstance(elem, kml.Folder):
+                any_deleted = False
+                notdeleted = []
+                for f in elem.features():
+                    if visitor(f, elem):
+                        any_deleted = True
+                    else:
+                        notdeleted.append(f)
+                if any_deleted:
+                    elem._features = notdeleted
+            elif hasattr(elem, 'features'):
+                for f in elem.features():
+                    visitor(f, folder)
+            elif self.predicate(getattr(elem, 'name', None), elem, folder):
+                return True
+            return False
+        visitor(node, None)
