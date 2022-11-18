@@ -10,7 +10,6 @@ Process survey fixes taken by a GNSS survey tool in KML/KMZ format.
 import logging
 import yaml
 
-from zipfile import ZipFile
 from fastkml import kml, styles, geometry
 from shapely.geometry import polygon
 
@@ -114,13 +113,7 @@ class Geofib:
             self.read(filename)
         
     def read(self, filename):
-        if filename.endswith('.kmz'):
-            kmz = ZipFile(filename, 'r')
-            with kmz.open('doc.kml', 'r') as kml:
-                self.doc.from_string(kml.read())
-        else:
-            with open(filename, encoding='utf-8') as kml:
-                self.doc.from_string(kml.read())
+        fastkmlutils.read_kml_file(filename, self.doc)
 
     def verify(self, elem=None):
         if elem is None:
@@ -217,41 +210,27 @@ class Geofib:
                 LOGGER.info(f'adding layer {f.name}')
             return f
 
-        def _move(elem, foldernames_to_ignore, parent_foldername):
-            if isinstance(elem, kml.Folder):
-                if elem.name not in foldernames_to_ignore:
-                    any_deleted = False
-                    notdeleted = []
-                    for f in elem.features():
-                        if _move(f, foldernames_to_ignore, elem.name):
-                            any_deleted = True
-                        else:
-                            notdeleted.append(f)
-                    if any_deleted:
-                        elem._features = notdeleted
-            elif hasattr(elem, 'features'):
-                for f in elem.features():
-                    _move(f, foldernames_to_ignore, elem.name)
-            elif parent_foldername and isinstance(getattr(elem, 'geometry', None), geometry.Point):
-                # we are a leaf Point within a folder
+        foldernames_to_ignore = { v[0] for v in self.fixnames.values() }
+        def _move(name, elem, folder):
+            if isinstance(getattr(elem, 'geometry', None), geometry.Point) and folder and folder.name not in foldernames_to_ignore:
+                # we are a leaf Point within a folder we are not ignoring
                 for (k, props) in self.fixnames.items():
-                    if k in elem.name:
-                        if parent_foldername != props[0] or (not foldernames_to_ignore):
-                            LOGGER.info(f'moving {elem.name} from {parent_foldername} to {props[0]}')
+                    if k in name:
+                        if folder.name != props[0]:
+                            LOGGER.info(f'moving {elem.name} from {folder.name} to {props[0]}')
                             _get_folder_for(props[0]).append(elem)
                             return True
                         break
                 else:  # we don't match any of the predefined fix types
-                    LOGGER.info(f'moving {elem.name} from {parent_foldername} to {default_folder}')
+                    LOGGER.info(f'moving {elem.name} from {folder.name} to {default_folder}')
                     _get_folder_for(default_folder).append(elem)
                     return True
             return False
 
-        folders_to_ignore = { v[0] for v in self.fixnames.values() }
-        folders_to_ignore.add('Locator Fixes and Plow/Bore Controls') ### FIXME
-        _move(firstdoc, folders_to_ignore, '')
+        fastkmlutils.LeafDeleter(_move).operate(firstdoc)
+        foldernames_to_ignore.clear()  # ignore no folders for the remaining documents
         for otherdoc in dociter:
-            _move(otherdoc, {}, '')
+            fastkmlutils.LeafDeleter(_move).operate(otherdoc)
         for f in newfolders:
             # now that we are done with the iterator, add the new layers
             firstdoc.append(f)
@@ -358,14 +337,24 @@ class Geofib:
         c = fastkmlutils.Collector(lambda n, e, f: (f, e) if isinstance(e, kml.Placemark) and n == placemark_name else None)
         return c.first(next(self.doc.features())) or (None, None)
 
+    def _find_or_create_placemark(self, name, styleUrl, folder=None):
+        """If name exists, return it.
+        If it doesn't exist create a Placemark in folder with styleUrl, and return the
+        newly created object. If folder is None, uses the first folder.
+        """
+        (f, pmark) = self.folder_element(name)  # existing elemnt with this name?
+        if not pmark:
+            pmark = kml.Placemark(name=name, styleUrl=styleUrl)
+            if not folder:
+                folder = fastkmlutils.Collector(lambda n, e, f: f).first(self.doc)
+            folder.append(pmark)
+        return pmark
+
     def add_polyline(self, name, spec):
         (traverse, coords, comments) = self._add_poly(name, spec, polytype='polyline')
         pline = geometry.LineString([(pos.longitude, pos.latitude) for pos in traverse.points])
-        (f, polyline_elem) = self.folder_element(name)  # existing polyline of this name?
-        if not polyline_elem:
-            polyline_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
-            (tie_folder, tie_elem) = self.folder_element(spec[0][0])
-            tie_folder.append(polyline_elem)
+        (tie_folder, tie_elem) = self.folder_element(spec[0][0])
+        polyline_elem = self._find_or_create_placemark(name, '#defaultpoly', tie_folder)
         polyline_elem.geometry = pline
         polyline_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
         LOGGER.info(f'created polyline {name}')
@@ -375,11 +364,8 @@ class Geofib:
         if not coords:
             coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
         pgon = polygon.orient(polygon.Polygon(coords))
-        (f, polygon_elem) = self.folder_element(name)  # existing polygon of this name?
-        if not polygon_elem:
-            polygon_elem = kml.Placemark(name=name, styleUrl='#defaultpoly')
-            (tie_folder, tie_elem) = self.folder_element(spec[0][0])
-            tie_folder.append(polygon_elem)
+        (tie_folder, tie_elem) = self.folder_element(spec[0][0])
+        polygon_elem = self._find_or_create_placemark(name, '#defaultpoly', tie_folder)
         polygon_elem.geometry = pgon
         polygon_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
         LOGGER.info(f'created polygon {name}')
@@ -409,9 +395,36 @@ class Geofib:
                 coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
             elif specitem == 'beginning':
                 traverse.begin()
-            elif specitem[0].lower() == 'centerline':
+            elif specitem[0] == 'centerline':
                 (centerline, right_f, left_f) = specitem
                 coords = [(pos.longitude, pos.latitude) for pos in traverse.as_centerline(right_f, left_f)]
+            elif specitem[0] == 'arcleft' or specitem[0] == 'arcright':
+                arcleft = specitem[0] == 'arcleft'
+                (arc, radius, delta, arclength, *comment) = specitem
+                try:
+                    degrees = float(delta)
+                    if degrees < 0 or degrees > 175:
+                        # technically one can have a delta larger than 180 degrees
+                        # but we don't support it
+                        raise GeofibError(f'angle must be between 0 and 175: {delta}')
+                except ValueError:
+                    if len(delta) == 9 and delta[0] == '1':
+                        degrees = 100 + cogo.parse_angle(delta[1:])
+                    else:
+                        degrees = cogo.parse_angle(delta)
+                if arcleft:
+                    degrees = -degrees
+                def _approx_arc_by_chord(degrees):
+                    if abs(degrees) < 18:
+                        chordlength = cogo.chord_from_arc(radius, degrees)
+                        traverse.thence_chord(chordlength, degrees)
+                    else:
+                        half_angle = degrees / 2
+                        _approx_arc_by_chord(half_angle)
+                        _approx_arc_by_chord(half_angle)
+                _approx_arc_by_chord(degrees)
+                if comment:
+                    comments.append(comment[0])
             else:
                 (dir1, alpha, dir2, distance, *comment) = specitem
                 azimuth = cogo.parse_azimuth(specitem)
@@ -423,7 +436,7 @@ class Geofib:
 
     def add_poly_from_fixes(self, projector_elem=None):
         if projector_elem is None:
-            c = fastkmlutils.Collector(lambda name, e, f: elem if ' PARTITION ' in name or ' PROJECTOR ' in name else None)
+            c = fastkmlutils.Collector(lambda name, e, f: e if ' PARTITION ' in name or ' PROJECTOR ' in name else None)
             projector_elems = c.collect(self.doc)
             for e in projector_elems:
                 self.add_poly_from_fixes(projector_elem=e)
@@ -437,7 +450,7 @@ class Geofib:
         if sep:
             left_geo = projector_geo.buffer(distance_deg, single_sided=True)
             right_geo = projector_geo.buffer(-distance_deg, single_sided=True)
-            assert right is not None, name
+            assert right_geo is not None, name
         else:
             (name, sep, selector_spec) = projector_elem.name.partition(' PROJECTOR ')
             if not sep:
@@ -446,27 +459,71 @@ class Geofib:
             right_geo = None
         selectors = selector_spec.split()
 
-        def _select_points(elem, left_accum, right_accum):
-            if hasattr(elem, 'features'):
-                for f in elem.features():
-                    _select_points(elem, left_accum, right_accum)
-            elif isinstance(getattr(elem, 'geometry', None), geometry.Point):
+        left_accum, right_accum = [], []
+        def _geomatch(name, elem, folder):
+            if isinstance(getattr(elem, 'geometry', None), geometry.Point):
                 # we are a leaf Point
                 for s in selectors:
-                    if s in elem.name:
+                    if s in name:
                         if left_geo.contains(elem.geometry):
                             left_accum.append((projector_geo.project(elem.geometry), elem))
                         elif right_geo and right_geo.contains(elem.geometry):
                             right_accum.append((projector_geo.project(elem.geometry), elem))
                         break
-        left_accum, right_accum = [], []
-        _select_points(self.doc, left_accum, right_accum)
-        left_accum.sort()
+        fastkmlutils.Collector(_geomatch).collect(self.doc)
+        pmark = self._find_or_create_placemark(name, '#defaultpoly')
         if right_accum:
-            right_accum.sort(key=lambda p: -1*p[0])
-        # create geo, put it in the appropriate Placemark (possibly create one)
+            right_accum.sort()
+            left_accum.sort(key=lambda p: -1*p[0])
+            if len(left_accum) == 0 or len(right_accum) == 0 or len(left_accum) + len(right_accum) < 3:
+                raise GeofibError(f'polygon {name} selects too few vertices: {len(left_accum)} {len(right_accum)}')
+            pmark.geometry = polygon.Polygon(
+                [v[1].geometry.coords[0] for v in right_accum + left_accum])
+            LOGGER.info(f'polygon {name} updated: {len(left_accum)+len(right_accum)} vertices')
+        else:
+            left_accum.sort()
+            if len(left_accum) < 2:
+                raise GeofibError(f'polyline {name} selects too few vertices: {len(left_accum)}')
+            pmark.geometry = geometry.LineString(
+                [v[1].geometry.coords[0] for v in left_accum])
+            LOGGER.info(f'polyline {name} updated: {len(left_accum)} vertices')
+        pmark.description = f'Vertices from {projector_elem.name}'
+
         # move the vertices to the archive layer if they aren't already there
         # (except for DWY which should not be moved).
+
+    def archive_poly_fixes(self):
+        """Move all Point placemarks in the base document to the archive layer
+        if it is a vertex in any polygon.
+        """
+        archived_pmarks = []
+        unarchived_pmarks = []
+        polygon_vertices = set()
+        polyline_vertices = set()
+        def _geomatch(name, elem, folder):
+            geom = getattr(elem, 'geometry', None)
+            if isinstance(geom, geometry.Point):
+                # we are a leaf Point
+                if folder.name == self.DEFAULT_FOLDER:
+                    archived_pmarks.append(elem)
+                else:
+                    unarchived_pmarks.append(elem)
+            elif isinstance(geom, geometry.Polygon):
+                polygon_vertices.update(set(geom.exterior.coords))
+            elif isinstance(geom, geometry.LineString):
+                polyline_vertices.update(set(geom.coords))
+        fastkmlutils.Collector(_geomatch).collect(next(self.doc.features()))
+
+        to_delete = set()
+        folder = fastkmlutils.Collector(lambda n, e, f: f if f.name == self.DEFAULT_FOLDER else None).first(next(self.doc.features()))
+        if polygon_vertices and folder:
+            for pmark in unarchived_pmarks:
+                x = pmark.geometry.coords[0]
+                if pmark.geometry.coords[0] in polygon_vertices and 'NOARCHIVE' not in (pmark.description or ''):
+                    to_delete.add(pmark)
+                    folder.append(pmark)
+        fastkmlutils.LeafDeleter(lambda n, e, f: f != folder and e in to_delete).operate(self.doc)
+        LOGGER.info(f'archived {len(to_delete)} of {len(unarchived_pmarks)} unarchived vertex placemarks')
 
     def set_properties(self, name=None, description=None, author=None):
         if name is None:
@@ -494,6 +551,13 @@ class Geofib:
             return self.emit(filename, prettyprint, dip if icon else '')
         # remove all but the first document
         self.doc._features = [next(self.doc.features())]
+        num_placemarks, layers = [0], set()
+        def _count(n, e, f):
+            layers.add(f.name)
+            if isinstance(e, kml.Placemark):
+                num_placemarks[0] += 1
+        folder = fastkmlutils.Collector(_count).collect(self.doc)
+        LOGGER.info(f'emitting {num_placemarks[0]} placemarks in {len(layers)} layers')
         if filename.endswith('.kml'):
             fastkmlutils.write_kml_file(filename, self.doc, prettyprint=prettyprint)
         elif filename.endswith('.kmz'):
@@ -522,7 +586,9 @@ def main(args):
     g.replace_styles()
     g.add_cogo()
     g.add_poly_from_fixes()
+    g.archive_poly_fixes()
     g.set_properties()
+    # for design: for each easement, subtract all ROW
     if config.get('output'):
         g.emit()
     return 0
