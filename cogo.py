@@ -10,6 +10,7 @@ import vincenty
 class ParseError(Exception):
     pass
 
+
 def chord_from_arc(r, delta):
     """Given a radius and delta azimuth (central angle in degrees),
     return the chord length = 2r sin(theta/2)
@@ -68,6 +69,7 @@ class Traverse:
         self.points = []
         self.rangeazimuths = []
         self.cursor = initial_position
+        self.last_azimuth = None
 
     def begin(self):
         """The cursor is at the True Point of Beginning."""
@@ -77,9 +79,19 @@ class Traverse:
         
     def thence_to(self, range_in_feet, azimuth):
         self.cursor.displace(range_in_feet, azimuth)
+        self.last_azimuth = azimuth
         if self.points:
             self.points.append(self.cursor.copy())
             self.rangeazimuths.append((range_in_feet, azimuth))
+
+    def thence_chord(self, range_in_feet, delta_azimuth):
+        """A negative delta_azimuth turns to the left, otherwise right."""
+        if self.last_azimuth is None:
+            raise ParseError(f'traverse cannot begin with an arc or chord')
+        last_azimuth = self.last_azimuth
+        self.thence_to(range_in_feet, last_azimuth + delta_azimuth/2)
+        # self.last_azimuth is the azimuth tangent to the curve endpoint
+        self.last_azimuth = last_azimuth + delta_azimuth
 
     def range_bearing_to_close(self):
         if len(self.points) < 3:
@@ -165,7 +177,7 @@ def parse_azimuth(tup):
     if ew != 'W' and not east:
         raise ParseError(f'third element must be E or W: {tup}')
     try:
-        angle = _parse_angle(tup[1])
+        angle = parse_angle(tup[1])
     except ValueError:
         raise ParseError(f'second element must be angle in decimal degrees or an 8-character string in DD MM SS format, and 0 <= angle <= 90: {tup}')
     if north:
@@ -173,7 +185,7 @@ def parse_azimuth(tup):
     else:
         return 180 - angle if east else 180 + angle
 
-def _parse_angle(elem):
+def parse_angle(elem):
     try:
         degrees = float(elem)
         if degrees < 0 or degrees > 90:
