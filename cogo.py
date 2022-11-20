@@ -63,29 +63,38 @@ class Traverse:
     calculating a rectangle corresponding to each segment of the traverse and
     then merging all those rectangles together.
     """
-    def __init__(self, name, initial_position, source=None):
+    def __init__(self, name, initial_position, initial_comment=''):
         self.name = name
-        self.source = source
+        self.comments = [initial_comment] if initial_comment else []
         self.points = []
         self.rangeazimuths = []
         self.cursor = initial_position
         self.last_azimuth = None
+        self.basis_adjustment = 0
+
+    def authority(self, source, basis_adjustment):
+        self.comments.append(f'Authority: {source}, basis adjusted {basis_adjustment} degrees')
+        self.basis_adjustment = basis_adjustment
 
     def begin(self):
         """The cursor is at the True Point of Beginning."""
+        self.comments.append('True Point of Beginning')
         if self.points:
             raise ParseError(f'beginning when already begun: while parsing {self.name} at {self.cursor}')
         self.points.append(self.cursor.copy())
         
-    def thence_to(self, range_in_feet, azimuth):
+    def thence_to(self, range_in_feet, azimuth, comment=''):
+        self.comments.append(f'Thence {range_in_feet} feet bearing {azimuth}{", " + comment if comment else ""}')
+        azimuth += self.basis_adjustment
         self.cursor.displace(range_in_feet, azimuth)
         self.last_azimuth = azimuth
         if self.points:
             self.points.append(self.cursor.copy())
             self.rangeazimuths.append((range_in_feet, azimuth))
 
-    def thence_chord(self, range_in_feet, delta_azimuth):
+    def thence_chord(self, range_in_feet, delta_azimuth, comment=''):
         """A negative delta_azimuth turns to the left, otherwise right."""
+        self.comments.append(f'Thence a chord {range_in_feet} feet with relative bearing {delta_azimuth}{", " + comment if comment else ""}')
         if self.last_azimuth is None:
             raise ParseError(f'traverse cannot begin with an arc or chord')
         last_azimuth = self.last_azimuth
@@ -94,10 +103,15 @@ class Traverse:
         self.last_azimuth = last_azimuth + delta_azimuth
 
     def range_bearing_to_close(self):
+        """Returns a tuple (range_in_feet, bearing_in_degrees). The bearing
+        is in the coordinate system's frame of reference, which is different
+        from the frame of reference of the specification if basis_adjustment
+        is nonzero."""
         if len(self.points) < 3:
             raise ParseError(f'closure needs >= 3 points: {self.name}, {self.points}')
         assert len(self.points) == len(self.rangeazimuths) + 1
         (r, b, ignore_reverse) = self.points[-1].range_bearing_to(self.points[0])
+        self.comments.append('Closes' if r < 0.05 else f'Range {r} bearing {b} to close')
         return (r, b)
 
     def as_polygon(self):
