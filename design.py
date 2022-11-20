@@ -3,12 +3,14 @@ design.py -
 
 """
 
-import logging
+import itertools, logging, math
 
 from fastkml import kml, styles, geometry
 from shapely.geometry import polygon
 
-import fastkmlutils
+import fastkmlutils, vincenty
+
+from cogo import Position
 
 LOGGER = logging.getLogger('geofib.design')
 
@@ -39,9 +41,9 @@ class Design:
         bbductwidth = self.config.get('bbductwidth', 1)
         _add('bbduct', self.config.get('bbductcolor', '#ff0080ff'), bbductwidth, 2*bbductwidth)
         dropductwidth = self.config.get('dropductwidth', 1)
-        _add('dropduct', self.config.get('dropductcolor', 'green'), dropductwidth, 2*dropductwidth)
+        _add('dropduct', self.config.get('dropductcolor', '#ff00ff00'), dropductwidth, 2*dropductwidth)
         fiberwidth = self.config.get('fiberwidth', 1)
-        _add('fiber', self.config.get('fibercolor', 'blue'), fiberwidth, 2*fiberwidth)
+        _add('fiber', self.config.get('fibercolor', '#ffffff00'), fiberwidth, 2*fiberwidth)
         def _addicon(name, file, iconscale, labelscale):
             self.designdoc.append_style(styles.Style(id=f'{name}norm', styles=[styles.IconStyle(scale=iconscale, icon_href=f'{kmliconprefix}{file}'), styles.LabelStyle(scale=0)]))
             self.designdoc.append_style(styles.Style(id=f'{name}high', styles=[styles.IconStyle(scale=iconscale, icon_href=f'{kmliconprefix}{file}'), styles.LabelStyle(scale=labelscale)]))
@@ -80,10 +82,27 @@ class Design:
                 d += f'<br>Installation method: {method}'
         elif duct or method:
             d = f'Product: {duct}<br>Installation method: {method}'
-        newpmark = kml.Placemark(name=newname if newname else pmarkname, styleUrl=styleUrl)
+        if isinstance(pmark.geometry, geometry.LineString):
+            lenspec = f' - {self.get_vincenty_length(pmark.geometry.coords)} FT'
+        else:
+            lenspec = ''
+        fullname = (newname if newname else pmarkname) + lenspec
+        newpmark = kml.Placemark(name=fullname, styleUrl=styleUrl)
         newpmark.description = d
         newpmark.geometry = pmark.geometry
         folder.append(newpmark)
+
+    def get_vincenty_length(self, coords):
+        """Given a coordinate sequence, use Vincenty's inverse to find the length
+        in feet of each segment, sum the lengths, and return the sum.
+        """
+        total = 0
+        a, b = itertools.tee(coords)
+        next(b, None)
+        for (pos1, pos2) in zip(a, b):
+            (r, bearing, reverse) = vincenty.rangebearing_from_positions(pos1[1], pos1[0], pos2[1], pos2[0])
+            total += r * Position.FEET_METERS_FACTOR
+        return 10 * math.ceil(total/10)
 
     def copy_vault(self, folder, pmarkname, styleUrl):
         pmark = fastkmlutils.Collector(lambda n, e, f: e if n == pmarkname else None).first(self.surveydoc)
