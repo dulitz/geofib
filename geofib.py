@@ -15,6 +15,8 @@ from shapely.geometry import polygon
 
 import cogo, fastkmlutils
 
+from design import Design
+
 LOGGER = logging.getLogger('geofib')
 
 
@@ -325,10 +327,15 @@ class Geofib:
         return k
 
     def add_cogo(self):
+        self.source_to_basis_adjustment = {}
         for (name, spec) in self.config.get('polygons', {}).items():
             self.add_polygon(name, spec)
         for (name, spec) in self.config.get('polylines', {}).items():
             self.add_polyline(name, spec)
+        for (source, balist) in self.source_to_basis_adjustment.items():
+            if len(balist) != 1:
+                s = [str(ba) for ba in balist]
+                LOGGER.warning(f'source {source} has multiple basis adjustments: {", ".join(s)}')
 
     def folder_element(self, placemark_name):
         """Returns a 2-tuple of elements, the second being the Placemark with the
@@ -351,29 +358,35 @@ class Geofib:
         return pmark
 
     def add_polyline(self, name, spec):
-        (traverse, coords, comments) = self._add_poly(name, spec, polytype='polyline')
+        if name.startswith('DISABLED:'):
+            return
+        (traverse, coords) = self._add_poly(name, spec, polytype='polyline')
         pline = geometry.LineString([(pos.longitude, pos.latitude) for pos in traverse.points])
         (tie_folder, tie_elem) = self.folder_element(spec[0][0])
         polyline_elem = self._find_or_create_placemark(name, '#defaultpoly', tie_folder)
         polyline_elem.geometry = pline
-        polyline_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
+        polyline_elem.description = '<br>'.join(traverse.comments)
         LOGGER.info(f'created polyline {name}')
 
     def add_polygon(self, name, spec, polytype='polygon'):
-        (traverse, coords, comments) = self._add_poly(name, spec, polytype='polygon')
+        if name.startswith('DISABLED:'):
+            return
+        (traverse, coords) = self._add_poly(name, spec, polytype='polygon')
         if not coords:
             coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
         pgon = polygon.orient(polygon.Polygon(coords))
         (tie_folder, tie_elem) = self.folder_element(spec[0][0])
         polygon_elem = self._find_or_create_placemark(name, '#defaultpoly', tie_folder)
         polygon_elem.geometry = pgon
-        polygon_elem.description = f'Authority: {traverse.source}<br>' + '<br>'.join(comments)
+        polygon_elem.description = '<br>'.join(traverse.comments)
         LOGGER.info(f'created polygon {name}')
 
     def _add_poly(self, name, spec, polytype='polygon'):
         if len(spec) < 2:
             raise GeofibError(f'{polytype} {name} specification too short')
-        (tie_name, tie_authority) = spec[0]
+        (tie_name, *comment) = spec[0]
+        if len(comment) > 1:
+            raise GeofibError(f'{polytype} {name} too many items in tie spec {spec[0]}')
         (tie_folder, tie_elem) = self.folder_element(tie_name)
         if not tie_elem:
             raise GeofibError(f'{polytype} {name} nonexistent tie fix: {tie_name}')
@@ -382,9 +395,9 @@ class Geofib:
             raise GeofibError(f'{polytype} {name}: tie fix {tie_name} does not have Point geometry')
 
         position = cogo.Position(tie_geometry.y, tie_geometry.x)
-        traverse = cogo.Traverse(name, position, source=tie_authority)
+        traverse = cogo.Traverse(name, position, initial_comment=', '.join([f'Tie: {tie_name}'] + comment))
         coords = []
-        comments = []
+        began = False
         for specitem in spec[1:]:
             if coords:
                 raise GeofibError(f'{polytype} {name} already complete but read {specitem}')
@@ -394,7 +407,20 @@ class Geofib:
                     LOGGER.warning(f'{polytype} {name} does not close by {range_f} feet bearing {bearing}')
                 coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
             elif specitem == 'beginning':
+                began = True
                 traverse.begin()
+            elif specitem[0] == 'authority':
+                (authority, source, *basisadj) = specitem
+                if len(basisadj) > 1:
+                    raise GeofibError(f'{polytype} {name} authority spec too long')
+                basis_adjustment = basisadj[0] if basisadj else 0
+                balist = self.source_to_basis_adjustment.get(source, [])
+                if balist:
+                    if basis_adjustment not in balist:
+                        balist.append(basis_adjustment)
+                else:
+                    self.source_to_basis_adjustment[source] = [basis_adjustment]
+                traverse.authority(source, basis_adjustment)
             elif specitem[0] == 'centerline':
                 (centerline, right_f, left_f) = specitem
                 coords = [(pos.longitude, pos.latitude) for pos in traverse.as_centerline(right_f, left_f)]
@@ -414,25 +440,24 @@ class Geofib:
                         degrees = cogo.parse_angle(delta)
                 if arcleft:
                     degrees = -degrees
+                approx = ', '.join([f'approximating arc R {radius} delta {degrees} L {arclength} '] + comment)
                 def _approx_arc_by_chord(degrees):
                     if abs(degrees) < 18:
                         chordlength = cogo.chord_from_arc(radius, degrees)
-                        traverse.thence_chord(chordlength, degrees)
+                        traverse.thence_chord(chordlength, degrees, approx)
                     else:
                         half_angle = degrees / 2
                         _approx_arc_by_chord(half_angle)
                         _approx_arc_by_chord(half_angle)
                 _approx_arc_by_chord(degrees)
-                if comment:
-                    comments.append(comment[0])
             else:
                 (dir1, alpha, dir2, distance, *comment) = specitem
                 azimuth = cogo.parse_azimuth(specitem)
                 distance = specitem[3]
-                traverse.thence_to(distance, azimuth)
-                if comment:
-                    comments.append(comment[0])
-        return (traverse, coords, comments)
+                traverse.thence_to(distance, azimuth, ', '.join(comment))
+        if not began:
+            raise GeofibError(f'{polytype} {name} did not begin')
+        return (traverse, coords)
 
     def add_poly_from_fixes(self, projector_elem=None):
         if projector_elem is None:
@@ -591,6 +616,11 @@ def main(args):
     # for design: for each easement, subtract all ROW
     if config.get('output'):
         g.emit()
+
+    if config.get('designoutput'):
+        d = Design(config, next(g.doc.features()))
+        d.calculate()
+        d.emit()
     return 0
 
 
