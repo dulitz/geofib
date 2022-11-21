@@ -213,9 +213,21 @@ class Geofib:
             return f
 
         foldernames_to_ignore = { v[0] for v in self.fixnames.values() }
+        coordinates_to_ignore = set()
+        pmarknames_to_ignore_narrow = self.config.get('nocopy_placemarks_narrow', [])
+        pmarknames_to_ignore_broad = self.config.get('nocopy_placemarks_broad', [])
         def _move(name, elem, folder):
             if isinstance(getattr(elem, 'geometry', None), geometry.Point) and folder and folder.name not in foldernames_to_ignore:
                 # we are a leaf Point within a folder we are not ignoring
+                if elem.geometry.coords[0] in coordinates_to_ignore:
+                    LOGGER.debug(f'inhibiting move of {name} due to coordinates')
+                    return False
+                for n in pmarknames_to_ignore_broad:
+                    if n in name:
+                        return False
+                for n in pmarknames_to_ignore_narrow:
+                    if n in name and name.strip('0123456789 ~!*?') in pmarknames_to_ignore_narrow:
+                        return False
                 for (k, props) in self.fixnames.items():
                     if k in name:
                         if folder.name != props[0]:
@@ -231,6 +243,7 @@ class Geofib:
 
         fastkmlutils.LeafDeleter(_move).operate(firstdoc)
         foldernames_to_ignore.clear()  # ignore no folders for the remaining documents
+        coordinates_to_ignore = set(fastkmlutils.Collector(lambda n, e, f: e.geometry.coords[0] if f and isinstance(getattr(e, 'geometry', None), geometry.Point) else None).collect(firstdoc))
         for otherdoc in dociter:
             fastkmlutils.LeafDeleter(_move).operate(otherdoc)
         for f in newfolders:
@@ -395,7 +408,7 @@ class Geofib:
             raise GeofibError(f'{polytype} {name}: tie fix {tie_name} does not have Point geometry')
 
         position = cogo.Position(tie_geometry.y, tie_geometry.x)
-        traverse = cogo.Traverse(name, position, initial_comment=', '.join([f'Tie: {tie_name}'] + comment))
+        traverse = cogo.Traverse(name, position, initial_comment=', '.join([f'<b>Tie: {tie_name}</b>'] + comment))
         coords = []
         began = False
         for specitem in spec[1:]:
@@ -404,7 +417,7 @@ class Geofib:
             if specitem == 'closes':
                 (range_f, bearing) = traverse.range_bearing_to_close()
                 if range_f > 0.5:
-                    LOGGER.warning(f'{polytype} {name} does not close by {range_f} feet bearing {bearing}')
+                    LOGGER.warning(f'{polytype} {name} does not close by {range_f} feet bearing {round(bearing, 2)}')
                 coords = [(pos.longitude, pos.latitude) for pos in traverse.as_polygon()]
             elif specitem == 'beginning':
                 began = True
@@ -466,11 +479,12 @@ class Geofib:
             for e in projector_elems:
                 self.add_poly_from_fixes(projector_elem=e)
             return
+        LOGGER.debug(f'processing {projector_elem.name}')
         projector_geo = projector_elem.geometry
         assert isinstance(projector_geo, geometry.LineString), name
         desc = projector_elem.description.split()
         distance_f = int(desc[0]) if desc else 20.0
-        distance_deg = distance_f / 6074 / 60  # approximation is fine if not at poles
+        distance_deg = distance_f * cogo.Position.DEGREES_FEET_FACTOR  # approximation is fine if not at poles
         (name, sep, selector_spec) = projector_elem.name.partition(' PARTITION ')
         if sep:
             left_geo = projector_geo.buffer(distance_deg, single_sided=True)
@@ -484,6 +498,7 @@ class Geofib:
             right_geo = None
         selectors = selector_spec.split()
 
+        pointcount = [0]
         left_accum, right_accum = [], []
         def _geomatch(name, elem, folder):
             if isinstance(getattr(elem, 'geometry', None), geometry.Point):
@@ -491,9 +506,10 @@ class Geofib:
                 for s in selectors:
                     if s in name:
                         if left_geo.contains(elem.geometry):
-                            left_accum.append((projector_geo.project(elem.geometry), elem))
+                            left_accum.append((projector_geo.project(elem.geometry), pointcount[0], elem))
                         elif right_geo and right_geo.contains(elem.geometry):
-                            right_accum.append((projector_geo.project(elem.geometry), elem))
+                            right_accum.append((projector_geo.project(elem.geometry), pointcount[0], elem))
+                        pointcount[0] += 1
                         break
         fastkmlutils.Collector(_geomatch).collect(self.doc)
         pmark = self._find_or_create_placemark(name, '#defaultpoly')
@@ -503,14 +519,14 @@ class Geofib:
             if len(left_accum) == 0 or len(right_accum) == 0 or len(left_accum) + len(right_accum) < 3:
                 raise GeofibError(f'polygon {name} selects too few vertices: {len(left_accum)} {len(right_accum)}')
             pmark.geometry = polygon.Polygon(
-                [v[1].geometry.coords[0] for v in right_accum + left_accum])
+                [v[2].geometry.coords[0] for v in right_accum + left_accum])
             LOGGER.info(f'polygon {name} updated: {len(left_accum)+len(right_accum)} vertices')
         else:
             left_accum.sort()
             if len(left_accum) < 2:
                 raise GeofibError(f'polyline {name} selects too few vertices: {len(left_accum)}')
             pmark.geometry = geometry.LineString(
-                [v[1].geometry.coords[0] for v in left_accum])
+                [v[2].geometry.coords[0] for v in left_accum])
             LOGGER.info(f'polyline {name} updated: {len(left_accum)} vertices')
         pmark.description = f'Vertices from {projector_elem.name}'
 
