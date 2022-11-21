@@ -24,6 +24,7 @@ def chord_from_arc(r, delta):
 
 class Position:
     FEET_METERS_FACTOR = 3.2808398950131
+    DEGREES_FEET_FACTOR = 1.0 / 6074.0 / 60.0
 
     def __init__(self, latitude, longitude):
         self.latitude = latitude
@@ -73,18 +74,19 @@ class Traverse:
         self.basis_adjustment = 0
 
     def authority(self, source, basis_adjustment):
-        self.comments.append(f'Authority: {source}, basis adjusted {basis_adjustment} degrees')
+        self.comments.append('&nbsp;')  # leave a blank line
+        self.comments.append(f'<b>Authority: {source}</b>, basis adjusted {angle_as_dms_string(basis_adjustment)}')
         self.basis_adjustment = basis_adjustment
 
     def begin(self):
         """The cursor is at the True Point of Beginning."""
-        self.comments.append('True Point of Beginning')
+        self.comments.append('<b>True Point of Beginning<b>')
         if self.points:
             raise ParseError(f'beginning when already begun: while parsing {self.name} at {self.cursor}')
         self.points.append(self.cursor.copy())
         
     def thence_to(self, range_in_feet, azimuth, comment=''):
-        self.comments.append(f'Thence {range_in_feet} feet bearing {azimuth}{", " + comment if comment else ""}')
+        self.comments.append(f'Thence {range_in_feet} feet bearing {angle_as_dms_string(azimuth)}{", " + comment if comment else ""}')
         azimuth += self.basis_adjustment
         self.cursor.displace(range_in_feet, azimuth)
         self.last_azimuth = azimuth
@@ -94,7 +96,7 @@ class Traverse:
 
     def thence_chord(self, range_in_feet, delta_azimuth, comment=''):
         """A negative delta_azimuth turns to the left, otherwise right."""
-        self.comments.append(f'Thence a chord {range_in_feet} feet with relative bearing {delta_azimuth}{", " + comment if comment else ""}')
+        self.comments.append(f'Thence a chord {round(range_in_feet, 2)} feet with relative bearing {angle_as_dms_string(delta_azimuth)}{", " + comment if comment else ""}')
         if self.last_azimuth is None:
             raise ParseError(f'traverse cannot begin with an arc or chord')
         last_azimuth = self.last_azimuth
@@ -111,7 +113,7 @@ class Traverse:
             raise ParseError(f'closure needs >= 3 points: {self.name}, {self.points}')
         assert len(self.points) == len(self.rangeazimuths) + 1
         (r, b, ignore_reverse) = self.points[-1].range_bearing_to(self.points[0])
-        self.comments.append('Closes' if r < 0.05 else f'Range {r} bearing {b} to close')
+        self.comments.append('Closes' if r < 0.05 else f'Range {round(r, 2)} bearing {angle_as_dms_string(b)} to close')
         return (r, b)
 
     def as_polygon(self):
@@ -171,6 +173,20 @@ class Traverse:
         return right + left_rev
 
 
+def angle_as_dms(alpha):
+    """Given a floating-point number of degrees, returns a tuple (degrees, min, sec)."""
+    degrees = int(alpha)
+    remainder = 60 * (abs(alpha - degrees))
+    minutes = int(remainder)
+    seconds = 60 * (remainder - minutes)
+    return (degrees, minutes, seconds)
+
+
+def angle_as_dms_string(alpha, roundto=1):
+    (d, m, s) = angle_as_dms(alpha)
+    return f"{d}d {m}' {round(s, roundto)}" + '"'
+
+
 def parse_azimuth(tup):
     """Given a list or tuple with at least 3 elements, return the azimuth
     in floating-point degrees. Elements beyond the third, if any, are ignored.
@@ -198,6 +214,7 @@ def parse_azimuth(tup):
         return angle if east else 360 - angle
     else:
         return 180 - angle if east else 180 + angle
+
 
 def parse_angle(elem):
     try:
