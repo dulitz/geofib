@@ -30,6 +30,7 @@ class Geofib:
         self.doc = kml.KML()
         self.new_polystyles, self.new_iconstyles = {}, {}
         self.iconscale = iconscale if iconscale else float(self.config.get('iconscale', 1.0))
+        self.source_to_basis_adjustment = {}
 
     @property
     def DEFAULT_FOLDER(self):
@@ -143,10 +144,12 @@ class Geofib:
             for f in self.fixnames.keys():
                 s = s.replace(f.lower(), f)
             return s
-        (drop, sep, rest) = elem.description.partition('<p>Remarks: ')
+        (drop, sep, rest) = elem.description.partition('>Remarks: ')
         if sep:
             rest2 = rest.replace('</p>', '')
             (remarks, sep, rest) = rest2.partition('<p>')
+            if not sep:
+                (remarks, sep, rest) = rest2.partition('<br>')
             newname = upper(remarks)
             LOGGER.info(f'set name to {newname}')
             elem.name = newname
@@ -294,7 +297,7 @@ class Geofib:
                                    highlight=styles.StyleUrl(url=f'#{namehigh}')))
 
         newstyleids = set(self.new_iconstyles).union(self.new_polystyles)
-        self._fix_bad_styleurls(self.doc, newstyleids)
+        self._fix_bad_styleurls(firstdoc, newstyleids)
 
     def _clean_unused_styles(self, doc):
         """Removes IconStyle elements and associated stylemaps from doc._styles."""
@@ -340,7 +343,6 @@ class Geofib:
         return k
 
     def add_cogo(self):
-        self.source_to_basis_adjustment = {}
         for (name, spec) in self.config.get('polygons', {}).items():
             self.add_polygon(name, spec)
         for (name, spec) in self.config.get('polylines', {}).items():
@@ -634,7 +636,7 @@ def main(args):
         g.emit()
 
     if config.get('designoutput'):
-        d = Design(config, next(g.doc.features()))
+        d = Design(config, next(g.doc.features()), g.source_to_basis_adjustment)
         d.calculate()
         d.emit()
     return 0
