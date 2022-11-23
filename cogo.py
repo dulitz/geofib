@@ -176,7 +176,7 @@ class Traverse:
 def angle_as_dms(alpha):
     """Given a floating-point number of degrees, returns a tuple (degrees, min, sec)."""
     degrees = int(alpha)
-    remainder = 60 * (abs(alpha - degrees))
+    remainder = 60 * (alpha - degrees)
     minutes = int(remainder)
     seconds = 60 * (remainder - minutes)
     return (degrees, minutes, seconds)
@@ -184,7 +184,11 @@ def angle_as_dms(alpha):
 
 def angle_as_dms_string(alpha, roundto=1):
     (d, m, s) = angle_as_dms(alpha)
-    return f"{d}d {m}' {round(s, roundto)}" + '"'
+    if s:
+        return f"{d}d {m}' {round(s, roundto)}" + '"'
+    if m:
+        return f"{d}d {m}'"
+    return f"{d}d"
 
 
 def parse_azimuth(tup):
